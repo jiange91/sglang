@@ -12,6 +12,8 @@ python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct --batch 1 12 14 --input-len 256 512 --output-len 32 256 --result-filename out.jsonl --run-name after
 ## plot the results in series of lines:
 python -m sglang.bench_latency --result-filename out.jsonl --graph-sql="select run_name, batch_size, prefill_throughput from results"
+## profile
+python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3.1-8B-Instruct  --time-log-filename test_collection.jsonl --mem-fraction-static 0.6
 
 # Usage (correctness test):
 python -m sglang.bench_latency --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
@@ -82,6 +84,7 @@ class BenchArgs:
     input_len: Tuple[int] = (1024,)
     output_len: Tuple[int] = (16,)
     result_filename: str = ""
+    time_log_filename: str = "time_log.jsonl"
     correctness_test: bool = False
     # This is only used for correctness test
     cut_len: int = 4
@@ -90,7 +93,7 @@ class BenchArgs:
         "select run_name, batch_size, prefill_throughput from results where run_name='before'"
     )
     graph_filename: str = "out.png"
-
+    
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         parser.add_argument("--run-name", type=str, default=BenchArgs.run_name)
@@ -105,6 +108,9 @@ class BenchArgs:
         )
         parser.add_argument(
             "--result-filename", type=str, default=BenchArgs.result_filename
+        )
+        parser.add_argument(
+            "--time-log-filename", type=str, default=BenchArgs.time_log_filename
         )
         parser.add_argument("--correctness-test", action="store_true")
         parser.add_argument("--cut-len", type=int, default=BenchArgs.cut_len)
@@ -300,14 +306,14 @@ def synchronize(device):
 
 
 def latency_test_run_once(
-    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device
+    run_name, model_runner, rank_print, reqs, batch_size, input_len, output_len, device, tp_rank, time_log_filename, bench
 ):
-    max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
-    if batch_size > max_batch_size:
-        rank_print(
-            f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit"
-        )
-        return
+    # max_batch_size = model_runner.max_total_num_tokens // (input_len + output_len)
+    # if batch_size > max_batch_size:
+    #     rank_print(
+    #         f"skipping ({batch_size}, {input_len}, {output_len}) due to max batch size limit {model_runner.max_total_num_tokens} // ({input_len} + {output_len})"
+    #     )
+    #     return
 
     # Clear the pools.
     model_runner.req_to_token_pool.clear()
@@ -330,9 +336,9 @@ def latency_test_run_once(
     prefill_latency = time.time() - tic
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
-    rank_print(
-        f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-    )
+    # rank_print(
+    #     f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+    # )
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
@@ -347,18 +353,41 @@ def latency_test_run_once(
         tot_latency += latency
         throughput = batch_size / latency
         decode_latencies.append(latency)
-        if i < 5:
-            rank_print(
-                f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-            )
+        
+        new_token_per_req = [1 for _ in batch.reqs]
+        num_new_tokens = len(batch.reqs)
+        context_len_per_req = [len(req.fill_ids) for req in batch.reqs]
+        num_context_tokens = sum(context_len_per_req)
+        
+        if tp_rank == 0 and bench:
+            with open(time_log_filename, "a") as g:
+                json.dump(
+                    {
+                        "num_new_tokens": num_new_tokens,
+                        "num_context_tokens": num_context_tokens,
+                        "new_tokens_per_req": new_token_per_req,
+                        "context_len_per_req": context_len_per_req,
+                        "time": latency * 1000,
+                        "name": "Decode",
+                        "batch_size": len(batch.reqs),
+                    },
+                    g,
+                )
+                g.write("\n")
+
+        
+        # if i < 5:
+        #     rank_print(
+        #         f"Decode.  latency: {latency:6.5f} s, throughput: {throughput:9.2f} token/s"
+        #     )
 
     # record decode timing from 2nd output
     if output_len > 1:
         med_decode_latency = np.median(decode_latencies)
         med_decode_throughput = batch_size / med_decode_latency
-        rank_print(
-            f"Decode.  median latency: {med_decode_latency:6.5f} s, median throughput: {med_decode_throughput:9.2f} token/s"
-        )
+        # rank_print(
+        #     f"Decode.  median latency: {1000*med_decode_latency:6.5f} ms, mean latency: {1000*np.mean(decode_latencies):6.5f} ms, median throughput: {med_decode_throughput:9.2f} token/s"
+        # )
         measurement_results["median_decode_latency"] = med_decode_latency
         measurement_results["median_decode_throughput"] = med_decode_throughput
 
@@ -368,8 +397,42 @@ def latency_test_run_once(
     )
     measurement_results["total_latency"] = tot_latency
     measurement_results["total_throughput"] = throughput
+    measurement_results["decode_latencies"] = decode_latencies
     return measurement_results
 
+import random
+import numpy as np
+
+def generate_config():
+    max_batch_size = 128
+    num_data_point = 1000
+    total_tokens = 262144
+    min_seq_len = 30
+    
+    for i in range(num_data_point):
+        batch_size = random.randint(1, max_batch_size)
+        seq_lens = np.random.randint(min_seq_len, 2049, size=batch_size).tolist()
+        
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_new_tokens=BenchArgs.output_len,
+        )
+
+        reqs = []
+        for j in range(batch_size):
+            req = Req(
+                rid=j,
+                origin_input_text="",
+                origin_input_ids=[1] * seq_lens[j],
+                sampling_params=sampling_params,
+            )
+            req.prefix_indices = []
+            req.fill_ids = req.origin_input_ids
+            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
+            reqs.append(req)
+        yield reqs
+        
+        
 
 def latency_test(
     server_args,
@@ -399,25 +462,38 @@ def latency_test(
         bench_args.input_len[0],
         8,  # shorter decoding to speed up the warmup
         server_args.device,
+        tp_rank,
+        bench_args.time_log_filename,
+        bench=False
     )
     rank_print("Benchmark ...")
 
     # Run the sweep
     result_list = []
-    for bs, il, ol in itertools.product(
-        bench_args.batch_size, bench_args.input_len, bench_args.output_len
-    ):
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+    
+    
+    # for bs, il, ol in itertools.product(
+    #     bench_args.batch_size, bench_args.input_len, bench_args.output_len
+    # ):
+    #     reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
+    from tqdm import tqdm
+    pbar = tqdm(total=1000)
+    
+    for reqs in generate_config():
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
             rank_print,
             reqs,
-            bs,
-            il,
-            ol,
+            0,
+            0,
+            2,
             server_args.device,
+            tp_rank,
+            bench_args.time_log_filename,
+            bench=True
         )
+        pbar.update(1)
         if ret is not None:
             result_list.append(ret)
 
@@ -491,6 +567,7 @@ def plot_latency_test(
 
 
 def main(server_args, bench_args):
+    
     _set_envs_and_config(server_args)
 
     if server_args.model_path:
@@ -539,11 +616,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     server_args = ServerArgs.from_cli_args(args)
     bench_args = BenchArgs.from_cli_args(args)
-
+    
     logging.basicConfig(
         level=getattr(logging, server_args.log_level.upper()),
         format="%(message)s",
     )
+    
 
     try:
         main(server_args, bench_args)
