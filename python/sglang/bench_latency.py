@@ -13,7 +13,8 @@ python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3-8B-Instruct 
 ## plot the results in series of lines:
 python -m sglang.bench_latency --result-filename out.jsonl --graph-sql="select run_name, batch_size, prefill_throughput from results"
 ## profile
-python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3.1-8B-Instruct  --time-log-filename test_collection.jsonl --mem-fraction-static 0.6
+python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3.1-8B-Instruct  --time-log-filename test_collection.jsonl --mem-fraction-static 0.6 --load-format dummy
+python -m sglang.bench_latency --model-path meta-llama/Meta-Llama-3.1-8B-Instruct  --time-log-filename tp2_collection.jsonl --mem-fraction-static 0.6 --tp-size 2 --load-format dummy
 
 # Usage (correctness test):
 python -m sglang.bench_latency --model-path TinyLlama/TinyLlama-1.1B-Chat-v0.4 --correct
@@ -334,6 +335,26 @@ def latency_test_run_once(
     next_token_ids, _, batch = extend(reqs, model_runner)
     synchronize(device)
     prefill_latency = time.time() - tic
+    if tp_rank == 0 and bench:
+        new_token_per_req = [req.extend_input_len for req in batch.reqs]
+        num_new_tokens = sum(new_token_per_req)
+        context_len_per_req = [len(req.fill_ids) for req in batch.reqs]
+        num_context_tokens = sum(context_len_per_req)
+        with open(time_log_filename, "a") as g:
+            json.dump(
+                {
+                    "num_new_tokens": num_new_tokens,
+                    "num_context_tokens": num_context_tokens,
+                    "new_tokens_per_req": new_token_per_req,
+                    "context_len_per_req": context_len_per_req,
+                    "time": prefill_latency * 1000,
+                    "name": "Prefill",
+                    "batch_size": len(batch.reqs),
+                },
+                g,
+            )
+            g.write("\n")
+    
     tot_latency += prefill_latency
     throughput = input_len * batch_size / prefill_latency
     # rank_print(
@@ -403,15 +424,17 @@ def latency_test_run_once(
 import random
 import numpy as np
 
+num_data_point = 4000
+
 def generate_config():
-    max_batch_size = 128
-    num_data_point = 1000
-    total_tokens = 262144
+    max_batch_size = 256
     min_seq_len = 30
+    max_seq_len = 4096
     
+    workloads = []
     for i in range(num_data_point):
         batch_size = random.randint(1, max_batch_size)
-        seq_lens = np.random.randint(min_seq_len, 2049, size=batch_size).tolist()
+        seq_lens = np.random.randint(min_seq_len, max_seq_len+1, size=batch_size).tolist()
         
         sampling_params = SamplingParams(
             temperature=0,
@@ -430,8 +453,8 @@ def generate_config():
             req.fill_ids = req.origin_input_ids
             req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             reqs.append(req)
-        yield reqs
-        
+        workloads.append(reqs)
+    return workloads
         
 
 def latency_test(
@@ -439,6 +462,7 @@ def latency_test(
     port_args,
     bench_args,
     tp_rank,
+    workloads,
 ):
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
@@ -477,9 +501,9 @@ def latency_test(
     # ):
     #     reqs = prepare_synthetic_inputs_for_latency_test(bs, il)
     from tqdm import tqdm
-    pbar = tqdm(total=1000)
+    pbar = tqdm(total=num_data_point)
     
-    for reqs in generate_config():
+    for reqs in workloads:
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
@@ -585,9 +609,10 @@ def main(server_args, bench_args):
         )
 
     port_args = PortArgs.init_new(server_args)
+    workloads = generate_config()
 
     if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0)
+        work_func(server_args, port_args, bench_args, 0, workloads)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
@@ -598,6 +623,7 @@ def main(server_args, bench_args):
                     port_args,
                     bench_args,
                     tp_rank,
+                    workloads,
                 ),
             )
             proc.start()
