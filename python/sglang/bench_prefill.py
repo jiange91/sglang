@@ -159,51 +159,6 @@ def load_model(server_args, port_args, tp_rank):
         dist.barrier()
     return model_runner, tokenizer
 
-
-def prepare_inputs_for_correctness_test(bench_args, tokenizer):
-    prompts = [
-        "The capital of France is",
-        "The capital of the United Kindom is",
-        "Today is a sunny day and I like",
-    ]
-    input_ids = [tokenizer.encode(p) for p in prompts]
-    sampling_params = SamplingParams(
-        temperature=0,
-        max_new_tokens=BenchArgs.output_len,
-    )
-
-    reqs = []
-    for i in range(len(prompts)):
-        assert len(input_ids[i]) > bench_args.cut_len
-
-        tmp_input_ids = input_ids[i][: bench_args.cut_len]
-        req = Req(
-            rid=i,
-            origin_input_text=prompts[i],
-            origin_input_ids=tmp_input_ids,
-            sampling_params=sampling_params,
-        )
-        req.prefix_indices = []
-        req.fill_ids = req.origin_input_ids
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-        reqs.append(req)
-
-    return input_ids, reqs
-
-
-def prepare_extend_inputs_for_correctness_test(
-    bench_args, input_ids, reqs, model_runner
-):
-    for i in range(len(reqs)):
-        req = reqs[i]
-        req.fill_ids += input_ids[i][bench_args.cut_len :]
-        req.prefix_indices = model_runner.req_to_token_pool.req_to_token[
-            i, : bench_args.cut_len
-        ]
-        req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-    return reqs
-
-
 def prepare_synthetic_inputs_for_latency_test(batch_size, input_len):
     input_ids = np.ones((batch_size, input_len), dtype=np.int32)
     sampling_params = SamplingParams(
@@ -255,50 +210,6 @@ def decode(input_token_ids, batch, model_runner):
     return next_token_ids, logits_output.next_token_logits
 
 
-def correctness_test(
-    server_args,
-    port_args,
-    bench_args,
-    tp_rank,
-):
-    configure_logger(server_args, prefix=f" TP{tp_rank}")
-    rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-
-    # Load the model
-    model_runner, tokenizer = load_model(server_args, port_args, tp_rank)
-
-    # Prepare inputs
-    input_ids, reqs = prepare_inputs_for_correctness_test(bench_args, tokenizer)
-    rank_print(f"\n{input_ids=}\n")
-
-    if bench_args.cut_len > 0:
-        # Prefill
-        next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-        rank_print(f"prefill logits (first half): {next_token_logits} \n")
-
-    # Prepare extend inputs
-    reqs = prepare_extend_inputs_for_correctness_test(
-        bench_args, input_ids, reqs, model_runner
-    )
-
-    # Extend
-    next_token_ids, next_token_logits, batch = extend(reqs, model_runner)
-    rank_print(f"prefill logits (final): {next_token_logits} \n")
-
-    # Decode
-    output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
-    for _ in range(bench_args.output_len[0] - 1):
-        next_token_ids, _ = decode(next_token_ids, batch, model_runner)
-        next_token_ids_list = next_token_ids.tolist()
-        for i in range(len(reqs)):
-            output_ids[i].append(next_token_ids_list[i])
-
-    # Print
-    for i in range(len(reqs)):
-        rank_print(f"========== Prompt {i} ==========")
-        rank_print(tokenizer.decode(output_ids[i]), "\n")
-
-
 def synchronize(device):
     if device == "cuda":
         torch.cuda.synchronize()
@@ -330,11 +241,18 @@ def latency_test_run_once(
     tot_latency = 0
 
     # Prefill
-    synchronize(device)
-    tic = time.time()
+    # synchronize(device)
+    # tic = time.time()
+    start = torch.cuda.Event(enable_timing=True)
+    start.record()
+    end = torch.cuda.Event(enable_timing=True)
     next_token_ids, _, batch = extend(reqs, model_runner)
-    synchronize(device)
-    prefill_latency = time.time() - tic
+    end.record()
+    end.synchronize()
+    prefill_latency = start.elapsed_time(end)
+    
+    # synchronize(device)
+    # prefill_latency = time.time() - tic
     if tp_rank == 0 and bench:
         new_token_per_req = [req.extend_input_len for req in batch.reqs]
         num_new_tokens = sum(new_token_per_req)
@@ -348,18 +266,20 @@ def latency_test_run_once(
                     "new_tokens_per_req": new_token_per_req,
                     "context_len_per_req": context_len_per_req,
                     "time": prefill_latency * 1000,
-                    "name": "Prefill",
+                    "name": "Extend",
                     "batch_size": len(batch.reqs),
                 },
                 g,
             )
             g.write("\n")
+            
+            
+    rank_print(
+        f"Prefill. latency: {prefill_latency:6.5f} ms"
+    )
     
     tot_latency += prefill_latency
-    throughput = input_len * batch_size / prefill_latency
-    # rank_print(
-    #     f"Prefill. latency: {prefill_latency:6.5f} s, throughput: {throughput:9.2f} token/s"
-    # )
+    throughput = input_len * batch_size / prefill_latency * 1000
     measurement_results["prefill_latency"] = prefill_latency
     measurement_results["prefill_throughput"] = throughput
 
@@ -413,9 +333,9 @@ def latency_test_run_once(
         measurement_results["median_decode_throughput"] = med_decode_throughput
 
     throughput = (input_len + output_len) * batch_size / tot_latency
-    rank_print(
-        f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
-    )
+    # rank_print(
+    #     f"Total. latency: {tot_latency:6.3f} s, throughput: {throughput:9.2f} token/s"
+    # )
     measurement_results["total_latency"] = tot_latency
     measurement_results["total_throughput"] = throughput
     measurement_results["decode_latencies"] = decode_latencies
@@ -427,19 +347,14 @@ import numpy as np
 num_data_point = 3000
 
 def generate_config():
-    max_batch_size = 256
-    min_seq_len = 128
-    max_seq_len = 8192
+    seq_len = 1101
     
-    workloads = []
-    for i in range(num_data_point):
-        # batch_size = random.randint(1, max_batch_size)
-        batch_size = 1
-        seq_lens = np.random.randint(min_seq_len, max_seq_len+1, size=batch_size).tolist()
-        
+    # for i in range(num_data_point):
+    while True:
+        batch_size = 5
         sampling_params = SamplingParams(
             temperature=0,
-            max_new_tokens=BenchArgs.output_len,
+            max_new_tokens=1,
         )
 
         reqs = []
@@ -447,24 +362,22 @@ def generate_config():
             req = Req(
                 rid=j,
                 origin_input_text="",
-                origin_input_ids=[1] * seq_lens[j],
+                origin_input_ids=[1] * seq_len,
                 sampling_params=sampling_params,
             )
             req.prefix_indices = []
             req.fill_ids = req.origin_input_ids
             req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
             reqs.append(req)
-        workloads.append(reqs)
-    return workloads
-        
+        yield reqs
 
 def latency_test(
     server_args,
     port_args,
     bench_args,
     tp_rank,
-    workloads,
 ):
+    workloads = generate_config()
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
@@ -489,7 +402,7 @@ def latency_test(
         server_args.device,
         tp_rank,
         bench_args.time_log_filename,
-        bench=False
+        bench=False,
     )
     rank_print("Benchmark ...")
 
@@ -516,9 +429,9 @@ def latency_test(
             server_args.device,
             tp_rank,
             bench_args.time_log_filename,
-            bench=True
+            bench=False,
         )
-        pbar.update(1)
+        # pbar.update(1)
         if ret is not None:
             result_list.append(ret)
 
@@ -596,10 +509,7 @@ def main(server_args, bench_args):
     _set_envs_and_config(server_args)
 
     if server_args.model_path:
-        if bench_args.correctness_test:
-            work_func = correctness_test
-        else:
-            work_func = latency_test
+        work_func = latency_test
     elif os.path.isfile(bench_args.result_filename):
         assert bench_args.graph_filename, "please provide a filename for the graph"
         work_func = plot_latency_test
@@ -610,10 +520,9 @@ def main(server_args, bench_args):
         )
 
     port_args = PortArgs.init_new(server_args)
-    workloads = generate_config()
 
     if server_args.tp_size == 1:
-        work_func(server_args, port_args, bench_args, 0, workloads)
+        work_func(server_args, port_args, bench_args, 0)
     else:
         workers = []
         for tp_rank in range(server_args.tp_size):
@@ -624,7 +533,6 @@ def main(server_args, bench_args):
                     port_args,
                     bench_args,
                     tp_rank,
-                    workloads,
                 ),
             )
             proc.start()
